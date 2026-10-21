@@ -1,0 +1,21 @@
+# Private router state and recovery material. Never publish these.
+*.json
+recovery/
+*.bin
+*.img
+*.dump
+*.tar
+*.tar.gz
+*.tgz
+*.pcap
+*.pcapng
+*.log
+*.pem
+*.key
+*.cookies
+.env
+.env.*
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/

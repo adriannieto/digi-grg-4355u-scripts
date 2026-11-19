@@ -32,9 +32,10 @@ This project does not turn the device into a supported upstream OpenWrt router o
 | [`enable_admin.py`](enable_admin.py) | Gives the existing local account all defined RPC permission groups and verifies a fresh login. | Exposes the full LuCI configuration menus. |
 | [`enable_bridge.py`](enable_bridge.py) | Bridges fiber VLAN 20 to LAN5, with a rollback timer. Also contains the shared login/API client. | Lets your own router establish PPPoE through the 10G port. |
 | [`.gitignore`](.gitignore) | Excludes generated reports, recovery files, backups, and firmware dumps. | Keeps private router data out of Git. |
+| [`test_plan_offline.py`](test_plan_offline.py) | Exercises `plan()` and `enabled_pppoe_on_pon()` against fabricated `uci` data — no network calls, no router needed. | Lets a reviewer check the bridge-planning logic (including the `br-lan`-already-bridged case) without hardware. |
 
 Both scripts use only the Python standard library. Keep both files in the same directory.
-There is no test framework, CI pipeline, or installation process.
+There is no CI pipeline or installation process; run `python3 test_plan_offline.py` for the offline logic checks.
 
 ## How the privilege-escalation vulnerability works
 
@@ -75,7 +76,7 @@ This behavior was observed on this DIGI build. It is not a claim that standard O
 
 ## 1. Enable the full menus
 
-Use Python 3 in an interactive terminal on macOS or Linux.
+Use Python 3 in an interactive terminal on macOS, Linux, or Windows (both scripts run under the standard `python3`/`py` launcher there too — no extra dependencies).
 Connect the computer to Comtrend Wi-Fi or LAN1–LAN4. Keep this management connection during the procedure.
 From the directory containing both scripts, run:
 
@@ -135,6 +136,27 @@ The external router takes over internet routing. Comtrend Wi-Fi remains availabl
 
 Without `KEEP`, the router automatically rolls back after five minutes. The input deadline reserves 30 seconds for final API requests.
 Do not reboot during that interval. The rollback mechanism does not establish safety across a reboot.
+
+### If you already used the router's own "Puente" (bridge mode) WAN wizard
+
+On some firmware/UI combinations, the full admin menus (unlocked by `enable_admin.py`) expose a native way to create a
+**PON WAN** interface with **Modo del canal: Puente**. That wizard is a legitimate, intended mechanism — unlike the
+workaround below, it should not be undone by DIGI's TR-069 provisioning agent — but as observed it bridges the fiber
+VLAN (`pon.20`) directly into **`br-lan`** (the management LAN: LAN1–4 and Wi-Fi), not into LAN5. The MikroTik/your
+router then sees no PPPoE peer at all ("peer does not respond"), because the fiber traffic never reaches LAN5.
+
+`enable_bridge.py` now detects this case automatically: if `pon.20` is not feeding a local PPPoE interface but is
+already a member of `br-lan`, the script moves it out of `br-lan` and into its own `br-bridge` alongside `eth0.5.20`,
+with the same apply/verify/rollback safety net described above. You do not need to do anything differently — just run
+`enable_bridge.py` as usual, whether or not you already used the native wizard first.
+
+After applying, the script also re-reads the configuration and refuses to `confirm` (triggering the automatic
+rollback) if it finds **any** enabled PPPoE interface still riding the fiber (`pon` or any `pon.*` VLAN). This is a
+second, independent check, on top of the live-bridge verification: its purpose is to make sure the Comtrend itself is
+never left negotiating PPPoE with DIGI after the bridge is in place — only your own router should.
+
+This does not protect against DIGI's TR-069 agent reconfiguring the router again at some later time; that remains an
+inherent risk of leaving TR-069 enabled (see "Optional: remove the TR-069 packages" below).
 
 ## Recovery and inspection
 

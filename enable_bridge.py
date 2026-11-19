@@ -11,10 +11,15 @@ import json
 import os
 from pathlib import Path
 import re
-import select
 import ssl
 import sys
 import time
+
+try:
+    import msvcrt  # Windows: select() on stdin only supports sockets there.
+except ImportError:
+    msvcrt = None
+    import select
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -99,6 +104,34 @@ def operation(method, **args):
     return {"method": method, "args": {"config": "network", **args}}
 
 
+def physical(network, device):
+    """Resolve a uci "@section" alias chain down to the device it names."""
+    seen = set()
+    while isinstance(device, str) and device.startswith("@"):
+        name = device[1:]
+        if name in seen:
+            return None
+        seen.add(name)
+        device = network.get(name, {}).get("device")
+    return device
+
+
+def enabled_pppoe_on_pon(network):
+    """Names of uci interfaces that are an enabled PPPoE client riding the
+    fiber (pon, or any pon.* VLAN such as pon.20). Used both to find the
+    Comtrend's own existing WAN link and, after our change, to confirm none
+    is left running: with this script's bridge in place, only the GL router
+    should ever negotiate PPPoE with Digi, never the Comtrend itself."""
+    found = []
+    for name, value in network.items():
+        if value.get("proto") != "pppoe" or value.get("disabled") == "1":
+            continue
+        dev = physical(network, value.get("device"))
+        if dev == "pon" or (isinstance(dev, str) and dev.startswith("pon.")):
+            found.append(name)
+    return found
+
+
 def plan(network, mapping, tagged=True):
     """Return forward and inverse operations. Never copy credential fields."""
     if "LAN5(10G):eth0.5" not in sequence(mapping.get("port", {}).get("portmapping")):
@@ -118,20 +151,17 @@ def plan(network, mapping, tagged=True):
     if len(vlan) != 1 or vlan[0].get("ifname") != "pon" or str(vlan[0].get("vid")) != "20":
         raise Failure("The fiber VLAN 20 device is missing or changed. No changes made.")
 
-    def physical(device):
-        seen = set()
-        while isinstance(device, str) and device.startswith("@"):
-            name = device[1:]
-            if name in seen:
-                return None
-            seen.add(name)
-            device = network.get(name, {}).get("device")
-        return device
-
     ppps = [k for k, v in network.items() if v.get("proto") == "pppoe"
-            and physical(v.get("device")) == "pon.20"]
-    if not ppps:
-        raise Failure("No existing PPPoE interface uses pon.20. Inspect the configuration first.")
+            and physical(network, v.get("device")) == "pon.20"]
+    # Some firmware/UI combinations (the native "Puente"/bridge-mode WAN
+    # wizard, observed on DIG-1.3.22) create pon.20 already a member of
+    # br-lan instead of feeding a local PPPoE interface. Accept that case
+    # too: we just need to move it from br-lan into our own bridge.
+    already_in_lan = "pon.20" in sequence(network[lan_section].get("ports"))
+    if not ppps and not already_in_lan:
+        raise Failure(
+            "No existing PPPoE interface uses pon.20, and it is not bridged "
+            "into br-lan either. Inspect the configuration first.")
 
     # Only these exact signatures are recognized as our previous bridge objects.
     signatures = {
@@ -187,7 +217,8 @@ def plan(network, mapping, tagged=True):
         if absent:
             inverse.insert(0, operation("delete", section=section, options=absent))
 
-    ports = [p for p in sequence(network[lan_section].get("ports")) if p != "eth0.5"]
+    ports = [p for p in sequence(network[lan_section].get("ports"))
+             if p not in ("eth0.5", "pon.20")]
     if not ports:
         raise Failure("The change would remove every wired management port.")
     change(lan_section, {"ports": ports})
@@ -245,6 +276,37 @@ def bridge_is_up(router, tagged, ppps):
     return True
 
 
+def read_line_with_deadline(deadline):
+    """Read one line from stdin, or return None if the deadline passes first.
+
+    select.select() on stdin only works on POSIX; on Windows it only
+    accepts sockets (WinError 10038), so this polls msvcrt there instead.
+    """
+    if msvcrt is not None:
+        buf = []
+        while True:
+            if time.monotonic() >= deadline:
+                return None
+            if msvcrt.kbhit():
+                ch = msvcrt.getwche()
+                if ch in ("\r", "\n"):
+                    sys.stdout.write("\n")
+                    return "".join(buf)
+                if ch == "\b":
+                    if buf:
+                        buf.pop()
+                        sys.stdout.write(" \b")
+                    continue
+                buf.append(ch)
+            else:
+                time.sleep(0.05)
+    remaining = max(0, deadline - time.monotonic())
+    ready, _, _ = select.select([sys.stdin], [], [], remaining)
+    if not ready:
+        return None
+    return sys.stdin.readline().strip()
+
+
 def wait_for_success(deadline):
     print("\nConnect a SECOND device to the GL router and open a website.")
     print("Keep this computer connected to the Comtrend for management.")
@@ -252,8 +314,8 @@ def wait_for_success(deadline):
     print("Any other response, or no response before the deadline, restores the previous configuration.")
     remaining = max(0, deadline - time.monotonic())
     print(f"Time available for your check: {int(remaining)} seconds.")
-    ready, _, _ = select.select([sys.stdin], [], [], remaining)
-    return bool(ready) and sys.stdin.readline().strip() == "KEEP" and time.monotonic() < deadline
+    line = read_line_with_deadline(deadline)
+    return line is not None and line.strip() == "KEEP" and time.monotonic() < deadline
 
 
 def apply_and_verify(router, operations, timeout, tagged=True, ppps=(), restore=False):
@@ -287,14 +349,21 @@ def apply_and_verify(router, operations, timeout, tagged=True, ppps=(), restore=
             print("Recovery configuration applied. Check the expected connection before keeping it.")
         if restore:
             print("Type KEEP after you verify the recovered connection.")
-            ready, _, _ = select.select([sys.stdin], [], [], max(0, deadline - time.monotonic()))
-            accepted = bool(ready) and sys.stdin.readline().strip() == "KEEP"
+            line = read_line_with_deadline(deadline)
+            accepted = line is not None and line.strip() == "KEEP"
         else:
             accepted = wait_for_success(deadline)
         if not accepted or time.monotonic() >= deadline:
             raise Failure("The connection was not verified before the deadline.")
         if not restore and not bridge_is_up(router, tagged, ppps):
             raise Failure("The bridge changed during the internet check.")
+        if not restore:
+            leftover = enabled_pppoe_on_pon(router.network())
+            if leftover:
+                raise Failure(
+                    "An enabled PPPoE interface on the fiber survived the "
+                    f"change ({', '.join(leftover)}). Not confirming: the "
+                    "Comtrend would still negotiate with Digi itself.")
         router.rpc("uci", "confirm")
         kept = True
         print("SUCCESS: Configuration kept. Automatic rollback canceled.")
